@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Union
 
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -32,6 +33,9 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
+# Add TrustedHostMiddleware to allow WebSocket connections
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
+
 # Security
 security = HTTPBearer()
 
@@ -50,6 +54,9 @@ class GameState(BaseModel):
     guessed_letters: List[str]
     attempts_left: int
     status: str  # "in_progress", "won", "lost"
+    players: List[str] = []  # List of player IDs
+    current_player_index: int = 0  # Index of the current player in the players list
+    max_players: int = 2  # Maximum number of players allowed
 
 # Connection manager for WebSockets
 class ConnectionManager:
@@ -58,8 +65,16 @@ class ConnectionManager:
         self.game_states: Dict[str, GameState] = {}
         self.word_generator = RandomWords()
 
-    async def connect(self, websocket: WebSocket, game_id: str, custom_word: Optional[str] = None):
+    async def connect(self, websocket: WebSocket, game_id: str, player_id: str, custom_word: Optional[str] = None):
+        # Check if game exists and has reached max players
+        if game_id in self.game_states:
+            game_state = self.game_states[game_id]
+            if player_id not in game_state.players and len(game_state.players) >= game_state.max_players:
+                await websocket.close(code=1008, reason="Game is full")
+                return False
+        
         await websocket.accept()
+        
         if game_id not in self.active_connections:
             self.active_connections[game_id] = []
             # Initialize game state if it's a new game
@@ -73,9 +88,16 @@ class ConnectionManager:
                     word=word.lower(),
                     guessed_letters=[],
                     attempts_left=6,
-                    status="in_progress"
+                    status="in_progress",
+                    players=[player_id],
+                    current_player_index=0
                 )
+            elif player_id not in self.game_states[game_id].players:
+                # Add player to existing game if not already in
+                self.game_states[game_id].players.append(player_id)
+        
         self.active_connections[game_id].append(websocket)
+        return True
 
     def disconnect(self, websocket: WebSocket, game_id: str):
         self.active_connections[game_id].remove(websocket)
@@ -92,13 +114,44 @@ class ConnectionManager:
 
     def get_game_state(self, game_id: str) -> Optional[GameState]:
         return self.game_states.get(game_id)
+        
+    def restart_game(self, game_id: str, custom_word: Optional[str] = None) -> Optional[GameState]:
+        """Reset the game state for a new round"""
+        if game_id not in self.game_states:
+            return None
+            
+        # Keep the same players but reset the game
+        current_players = self.game_states[game_id].players
+        
+        # Use custom word if provided, otherwise generate a random word
+        if custom_word:
+            word = custom_word
+        else:
+            word = self.word_generator.get_random_word()
+            
+        # Create new game state
+        self.game_states[game_id] = GameState(
+            word=word.lower(),
+            guessed_letters=[],
+            attempts_left=6,
+            status="in_progress",
+            players=current_players,
+            current_player_index=0
+        )
+        
+        return self.game_states[game_id]
 
-    def update_game_state(self, game_id: str, letter: str) -> GameState:
+    def update_game_state(self, game_id: str, letter: str, player_id: str) -> GameState:
         game_state = self.game_states[game_id]
         
         # If game is already over, return current state
         if game_state.status != "in_progress":
             return game_state
+        
+        # Check if it's the player's turn
+        current_player = game_state.players[game_state.current_player_index]
+        if current_player != player_id:
+            return game_state  # Not this player's turn
             
         # Add letter to guessed letters if not already guessed
         if letter.lower() not in game_state.guessed_letters:
@@ -107,6 +160,9 @@ class ConnectionManager:
             # Check if letter is in the word
             if letter.lower() not in game_state.word:
                 game_state.attempts_left -= 1
+            
+            # Move to next player's turn
+            game_state.current_player_index = (game_state.current_player_index + 1) % len(game_state.players)
                 
         # Check win condition (all letters in word have been guessed)
         word_letters = set(game_state.word)
@@ -123,7 +179,7 @@ class ConnectionManager:
 # Initialize connection manager
 manager = ConnectionManager()
 
-# Authentication helper function
+# Authentication helper functions
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
     try:
@@ -136,6 +192,15 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             detail="Invalid authentication credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+def is_valid_token(token: str) -> bool:
+    """Validate a token using Supabase"""
+    try:
+        # Verify token with Supabase
+        supabase.auth.get_user(token)
+        return True
+    except Exception:
+        return False
 
 # Routes
 @app.get("/")
@@ -193,21 +258,45 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str):
     # Get query parameters
     query_params = dict(websocket.query_params)
     custom_word = query_params.get("word", None)
+    player_id = query_params.get("player_id", None)
+    token = query_params.get("token", None)
     
-    await manager.connect(websocket, game_id, custom_word)
+    # Validate token before allowing connection
+    if not token or not is_valid_token(token):
+        await websocket.close(code=403, reason="Invalid Token")
+        return
+    
+    # If no player_id provided, generate a random one
+    if not player_id:
+        player_id = str(random.randint(1000, 9999))
+    
+    connection_success = await manager.connect(websocket, game_id, player_id, custom_word)
+    if not connection_success:
+        return  # Connection was rejected (game full)
+        
     try:
         # Send initial game state
         game_state = manager.get_game_state(game_id)
-        await websocket.send_json({
+        
+        # Broadcast player joined message
+        await manager.broadcast({
+            "type": "info",
+            "data": f"Player {player_id} has joined the game"
+        }, game_id)
+        
+        # Send current game state
+        await manager.broadcast({
             "type": "game_state",
             "data": {
                 "word": "*" * len(game_state.word),  # Hide the actual word
                 "display_word": get_display_word(game_state.word, game_state.guessed_letters),
                 "guessed_letters": game_state.guessed_letters,
                 "attempts_left": game_state.attempts_left,
-                "status": game_state.status
+                "status": game_state.status,
+                "players": game_state.players,
+                "current_player": game_state.players[game_state.current_player_index]
             }
-        })
+        }, game_id)
         
         while True:
             data = await websocket.receive_text()
@@ -216,8 +305,8 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str):
             if message["type"] == "guess":
                 letter = message["letter"]
                 
-                # Update game state
-                game_state = manager.update_game_state(game_id, letter)
+                # Update game state with player ID for turn tracking
+                game_state = manager.update_game_state(game_id, letter, player_id)
                 
                 # Broadcast updated game state to all players
                 await manager.broadcast({
@@ -227,7 +316,9 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str):
                         "display_word": get_display_word(game_state.word, game_state.guessed_letters),
                         "guessed_letters": game_state.guessed_letters,
                         "attempts_left": game_state.attempts_left,
-                        "status": game_state.status
+                        "status": game_state.status,
+                        "players": game_state.players,
+                        "current_player": game_state.players[game_state.current_player_index]
                     }
                 }, game_id)
                 
@@ -245,6 +336,107 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str):
         await manager.broadcast({"type": "info", "data": "A player has left the game"}, game_id)
     except Exception as e:
         print(f"Error: {str(e)}")
+        await websocket.close()
+
+# Game Restart WebSocket route
+@app.websocket("/ws/restart/{game_id}")
+async def restart_game_endpoint(websocket: WebSocket, game_id: str):
+    # Get query parameters
+    query_params = dict(websocket.query_params)
+    custom_word = query_params.get("word", None)
+    player_id = query_params.get("player_id", None)
+    token = query_params.get("token", None)
+    
+    # Validate token before allowing connection
+    if not token or not is_valid_token(token):
+        await websocket.close(code=403, reason="Invalid Token")
+        return
+    
+    # If no player_id provided, generate a random one
+    if not player_id:
+        player_id = str(random.randint(1000, 9999))
+    
+    await websocket.accept()
+    
+    try:
+        # Check if game exists
+        if game_id not in manager.game_states:
+            await websocket.send_json({
+                "type": "error",
+                "data": "Game not found"
+            })
+            await websocket.close()
+            return
+            
+        # Check if player is part of the game
+        game_state = manager.get_game_state(game_id)
+        if player_id not in game_state.players:
+            await websocket.send_json({
+                "type": "error",
+                "data": "You are not part of this game"
+            })
+            await websocket.close()
+            return
+            
+        # Restart the game
+        game_state = manager.restart_game(game_id, custom_word)
+        
+        # Broadcast game restart message
+        await manager.broadcast({
+            "type": "info",
+            "data": "Game has been restarted"
+        }, game_id)
+        
+        # Send new game state
+        await manager.broadcast({
+            "type": "game_state",
+            "data": {
+                "word": "*" * len(game_state.word),  # Hide the actual word
+                "display_word": get_display_word(game_state.word, game_state.guessed_letters),
+                "guessed_letters": game_state.guessed_letters,
+                "attempts_left": game_state.attempts_left,
+                "status": game_state.status,
+                "players": game_state.players,
+                "current_player": game_state.players[game_state.current_player_index]
+            }
+        }, game_id)
+        
+        # Keep the connection open for further restart requests
+        while True:
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            
+            if message["type"] == "restart":
+                # Get custom word if provided
+                custom_word = message.get("word", None)
+                
+                # Restart the game
+                game_state = manager.restart_game(game_id, custom_word)
+                
+                # Broadcast game restart message
+                await manager.broadcast({
+                    "type": "info",
+                    "data": "Game has been restarted"
+                }, game_id)
+                
+                # Send new game state
+                await manager.broadcast({
+                    "type": "game_state",
+                    "data": {
+                        "word": "*" * len(game_state.word),  # Hide the actual word
+                        "display_word": get_display_word(game_state.word, game_state.guessed_letters),
+                        "guessed_letters": game_state.guessed_letters,
+                        "attempts_left": game_state.attempts_left,
+                        "status": game_state.status,
+                        "players": game_state.players,
+                        "current_player": game_state.players[game_state.current_player_index]
+                    }
+                }, game_id)
+    except WebSocketDisconnect:
+        # Just close the restart connection, don't affect the game
+        pass
+    except Exception as e:
+        print(f"Error in restart endpoint: {str(e)}")
         await websocket.close()
 
 # Helper function to get display word with guessed letters revealed
