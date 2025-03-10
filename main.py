@@ -338,6 +338,24 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str):
         print(f"Error: {str(e)}")
         await websocket.close()
 
+
+@app.get("/games/public")
+async def get_public_games():
+    """Return a list of public games that are in progress and open for more players."""
+    public_games = []
+    
+    for game_id, game_state in manager.game_states.items():
+        if game_state.status == "in_progress" and len(game_state.players) < game_state.max_players:
+            public_games.append({
+                "game_id": game_id,
+                "players": game_state.players,
+                "max_players": game_state.max_players,
+                "status": game_state.status
+            })
+    
+    return {"games": public_games}
+
+
 # Game Restart WebSocket route
 @app.websocket("/ws/restart/{game_id}")
 async def restart_game_endpoint(websocket: WebSocket, game_id: str):
