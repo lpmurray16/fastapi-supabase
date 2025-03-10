@@ -262,8 +262,8 @@ async def websocket_endpoint(websocket: WebSocket, game_id: str):
     token = query_params.get("token", None)
     
     # Validate token before allowing connection
-    if not token or not is_valid_token(token):
-        await websocket.close(code=403, reason="Invalid Token")
+    if not token or token == "undefined" or not is_valid_token(token):
+        await websocket.close(code=403, reason="Missing or invalid token")
         return
     
     # If no player_id provided, generate a random one
@@ -348,8 +348,8 @@ async def restart_game_endpoint(websocket: WebSocket, game_id: str):
     token = query_params.get("token", None)
     
     # Validate token before allowing connection
-    if not token or not is_valid_token(token):
-        await websocket.close(code=403, reason="Invalid Token")
+    if not token or token == "undefined" or not is_valid_token(token):
+        await websocket.close(code=403, reason="Missing or invalid token")
         return
     
     # If no player_id provided, generate a random one
