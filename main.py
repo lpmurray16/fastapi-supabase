@@ -2,16 +2,20 @@ import os
 import json
 import random
 from typing import Dict, List, Optional, Union
+from contextlib import contextmanager
 
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from random_word import RandomWords
+from uuid import uuid4
+
+# Import database connection function
+from db_connect import connect_to_db
+
 
 # Load environment variables
 load_dotenv()
@@ -20,6 +24,34 @@ load_dotenv()
 supabase_url = os.getenv("SUPABASE_URL")
 supabase_key = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(supabase_url, supabase_key)
+
+# Initialize database connection pool
+db_connection = None
+
+@contextmanager
+def get_db_cursor():
+    """Context manager for database cursor"""
+    global db_connection
+    
+    # Create a new connection if one doesn't exist or if it's closed
+    if db_connection is None or db_connection.closed:
+        db_connection = connect_to_db()
+        if db_connection is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to connect to database"
+            )
+    
+    # Create a cursor
+    cursor = db_connection.cursor()
+    try:
+        yield cursor
+        db_connection.commit()
+    except Exception as e:
+        db_connection.rollback()
+        raise e
+    finally:
+        cursor.close()
 
 # Initialize FastAPI app
 app = FastAPI(title="Hangman Game API")
@@ -33,9 +65,6 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-# Add TrustedHostMiddleware to allow WebSocket connections
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
-
 # Security
 security = HTTPBearer()
 
@@ -45,11 +74,16 @@ class UserCreate(BaseModel):
     password: str
     username: str
 
+class GameCreate(BaseModel):
+    word: Optional[str] = None  # Word for the game (optional)
+    max_players: Optional[int] = 2  # Default max players is 2
+
 class UserLogin(BaseModel):
     email: str
     password: str
 
 class GameState(BaseModel):
+    id: str
     word: str
     guessed_letters: List[str]
     attempts_left: int
@@ -57,127 +91,52 @@ class GameState(BaseModel):
     players: List[str] = []  # List of player IDs
     current_player_index: int = 0  # Index of the current player in the players list
     max_players: int = 2  # Maximum number of players allowed
+    created_at: Optional[str] = None
 
-# Connection manager for WebSockets
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: Dict[str, List[WebSocket]] = {}
-        self.game_states: Dict[str, GameState] = {}
-        self.word_generator = RandomWords()
+class GuessRequest(BaseModel):
+    letter: str
+    player_id: str
 
-    async def connect(self, websocket: WebSocket, game_id: str, player_id: str, custom_word: Optional[str] = None):
-        # Check if game exists and has reached max players
-        if game_id in self.game_states:
-            game_state = self.game_states[game_id]
-            if player_id not in game_state.players and len(game_state.players) >= game_state.max_players:
-                await websocket.close(code=1008, reason="Game is full")
-                return False
-        
-        await websocket.accept()
-        
-        if game_id not in self.active_connections:
-            self.active_connections[game_id] = []
-            # Initialize game state if it's a new game
-            if game_id not in self.game_states:
-                # Use custom word if provided, otherwise generate a random word
-                if custom_word:
-                    word = custom_word
-                else:
-                    word = self.word_generator.get_random_word()
-                self.game_states[game_id] = GameState(
-                    word=word.lower(),
-                    guessed_letters=[],
-                    attempts_left=6,
-                    status="in_progress",
-                    players=[player_id],
-                    current_player_index=0
-                )
-            elif player_id not in self.game_states[game_id].players:
-                # Add player to existing game if not already in
-                self.game_states[game_id].players.append(player_id)
-        
-        self.active_connections[game_id].append(websocket)
-        return True
+class JoinGameRequest(BaseModel):
+    player_id: str
 
-    def disconnect(self, websocket: WebSocket, game_id: str):
-        self.active_connections[game_id].remove(websocket)
-        if not self.active_connections[game_id]:
-            # Clean up if no connections left for this game
-            del self.active_connections[game_id]
-            if game_id in self.game_states:
-                del self.game_states[game_id]
+# Helper functions
+def get_display_word(word: str, guessed_letters: List[str]) -> str:
+    return "".join([letter if letter in guessed_letters else "_" for letter in word])
 
-    async def broadcast(self, message: dict, game_id: str):
-        if game_id in self.active_connections:
-            for connection in self.active_connections[game_id]:
-                await connection.send_json(message)
-
-    def get_game_state(self, game_id: str) -> Optional[GameState]:
-        return self.game_states.get(game_id)
-        
-    def restart_game(self, game_id: str, custom_word: Optional[str] = None) -> Optional[GameState]:
-        """Reset the game state for a new round"""
-        if game_id not in self.game_states:
-            return None
-            
-        # Keep the same players but reset the game
-        current_players = self.game_states[game_id].players
-        
-        # Use custom word if provided, otherwise generate a random word
-        if custom_word:
-            word = custom_word
-        else:
-            word = self.word_generator.get_random_word()
-            
-        # Create new game state
-        self.game_states[game_id] = GameState(
-            word=word.lower(),
-            guessed_letters=[],
-            attempts_left=6,
-            status="in_progress",
-            players=current_players,
-            current_player_index=0
-        )
-        
-        return self.game_states[game_id]
-
-    def update_game_state(self, game_id: str, letter: str, player_id: str) -> GameState:
-        game_state = self.game_states[game_id]
-        
-        # If game is already over, return current state
-        if game_state.status != "in_progress":
-            return game_state
-        
-        # Check if it's the player's turn
-        current_player = game_state.players[game_state.current_player_index]
-        if current_player != player_id:
-            return game_state  # Not this player's turn
-            
-        # Add letter to guessed letters if not already guessed
-        if letter.lower() not in game_state.guessed_letters:
-            game_state.guessed_letters.append(letter.lower())
-            
-            # Check if letter is in the word
-            if letter.lower() not in game_state.word:
-                game_state.attempts_left -= 1
-            
-            # Move to next player's turn
-            game_state.current_player_index = (game_state.current_player_index + 1) % len(game_state.players)
-                
-        # Check win condition (all letters in word have been guessed)
-        word_letters = set(game_state.word)
-        guessed_correct = word_letters.intersection(set(game_state.guessed_letters))
-        if len(guessed_correct) == len(word_letters):
-            game_state.status = "won"
-            
-        # Check lose condition (no attempts left)
-        if game_state.attempts_left <= 0:
-            game_state.status = "lost"
-            
+# Game logic functions
+def update_game_state(game_state: GameState, letter: str, player_id: str) -> GameState:
+    # If game is already over, return current state
+    if game_state.status != "in_progress":
         return game_state
-
-# Initialize connection manager
-manager = ConnectionManager()
+    
+    # Check if it's the player's turn
+    current_player = game_state.players[game_state.current_player_index]
+    if current_player != player_id:
+        return game_state  # Not this player's turn
+        
+    # Add letter to guessed letters if not already guessed
+    if letter.lower() not in game_state.guessed_letters:
+        game_state.guessed_letters.append(letter.lower())
+        
+        # Check if letter is in the word
+        if letter.lower() not in game_state.word:
+            game_state.attempts_left -= 1
+        
+        # Move to next player's turn
+        game_state.current_player_index = (game_state.current_player_index + 1) % len(game_state.players)
+            
+    # Check win condition (all letters in word have been guessed)
+    word_letters = set(game_state.word)
+    guessed_correct = word_letters.intersection(set(game_state.guessed_letters))
+    if len(guessed_correct) == len(word_letters):
+        game_state.status = "won"
+        
+    # Check lose condition (no attempts left)
+    if game_state.attempts_left <= 0:
+        game_state.status = "lost"
+        
+    return game_state
 
 # Authentication helper functions
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -252,215 +211,316 @@ async def logout(user = Depends(get_current_user)):
             detail=str(e),
         )
 
-# Game WebSocket route
-@app.websocket("/ws/game/{game_id}")
-async def websocket_endpoint(websocket: WebSocket, game_id: str):
-    # Get query parameters
-    query_params = dict(websocket.query_params)
-    custom_word = query_params.get("word", None)
-    player_id = query_params.get("player_id", None)
-    token = query_params.get("token", None)
+# Game routes
+@app.post("/games")
+async def create_game(game_data: GameCreate, user = Depends(get_current_user)):
+    """Create a new game and return its ID."""
     
-    # Validate token before allowing connection
-    if not token or token == "undefined" or not is_valid_token(token):
-        await websocket.close(code=403, reason="Missing or invalid token")
-        return
+    # Generate a unique game ID
+    new_game_id = str(random.randint(1000, 9999))
     
-    # If no player_id provided, generate a random one
-    if not player_id:
-        player_id = str(random.randint(1000, 9999))
+    # Get user ID from the token
+    user_id = user.user.id
     
-    connection_success = await manager.connect(websocket, game_id, player_id, custom_word)
-    if not connection_success:
-        return  # Connection was rejected (game full)
-        
+    # Ensure the word is set correctly
+    word = game_data.word.lower() if game_data.word else RandomWords().get_random_word().lower()
+    
+    # Create game state
+    game_state = {
+        "id": new_game_id,
+        "word": word,
+        "guessed_letters": [],
+        "attempts_left": 6,
+        "status": "in_progress",
+        "players": [user_id],
+        "current_player_index": 0,
+        "max_players": game_data.max_players
+    }
+    
+    # Store game in database using direct connection
     try:
-        # Send initial game state
-        game_state = manager.get_game_state(game_id)
+        # Convert Python list to PostgreSQL array format
+        players_array = json.dumps(game_state["players"])
+        guessed_letters_array = json.dumps(game_state["guessed_letters"])
         
-        # Broadcast player joined message
-        await manager.broadcast({
-            "type": "info",
-            "data": f"Player {player_id} has joined the game"
-        }, game_id)
+        query = """
+        INSERT INTO games (id, word, guessed_letters, attempts_left, status, players, current_player_index, max_players)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """
         
-        # Send current game state
-        await manager.broadcast({
-            "type": "game_state",
-            "data": {
-                "word": "*" * len(game_state.word),  # Hide the actual word
-                "display_word": get_display_word(game_state.word, game_state.guessed_letters),
-                "guessed_letters": game_state.guessed_letters,
-                "attempts_left": game_state.attempts_left,
-                "status": game_state.status,
-                "players": game_state.players,
-                "current_player": game_state.players[game_state.current_player_index]
-            }
-        }, game_id)
+        execute_query(
+            query, 
+            (new_game_id, word, guessed_letters_array, 6, "in_progress", players_array, 0, game_data.max_players)
+        )
         
-        while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
-            
-            if message["type"] == "guess":
-                letter = message["letter"]
-                
-                # Update game state with player ID for turn tracking
-                game_state = manager.update_game_state(game_id, letter, player_id)
-                
-                # Broadcast updated game state to all players
-                await manager.broadcast({
-                    "type": "game_state",
-                    "data": {
-                        "word": "*" * len(game_state.word),  # Hide the actual word
-                        "display_word": get_display_word(game_state.word, game_state.guessed_letters),
-                        "guessed_letters": game_state.guessed_letters,
-                        "attempts_left": game_state.attempts_left,
-                        "status": game_state.status,
-                        "players": game_state.players,
-                        "current_player": game_state.players[game_state.current_player_index]
-                    }
-                }, game_id)
-                
-                # If game is over, reveal the word
-                if game_state.status != "in_progress":
-                    await manager.broadcast({
-                        "type": "game_over",
-                        "data": {
-                            "word": game_state.word,
-                            "status": game_state.status
-                        }
-                    }, game_id)
-    except WebSocketDisconnect:
-        manager.disconnect(websocket, game_id)
-        await manager.broadcast({"type": "info", "data": "A player has left the game"}, game_id)
+        # We can still use Supabase for realtime features
+        supabase.channel(f"game-{new_game_id}").subscribe()
+        
+        return {"game_id": new_game_id, "message": "Game created successfully"}
     except Exception as e:
-        print(f"Error: {str(e)}")
-        await websocket.close()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create game: {str(e)}"
+        )
 
+@app.get("/games/{game_id}")
+async def get_game(game_id: str, user = Depends(get_current_user)):
+    """Get the current state of a game."""
+    try:
+        # Use direct database connection instead of Supabase
+        query = "SELECT * FROM games WHERE id = %s"
+        results = execute_query(query, (game_id,))
+        
+        if not results:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Game not found"
+            )
+        
+        game_state = results[0]
+        
+        # Hide the actual word in the response
+        display_data = {
+            "id": game_state["id"],
+            "display_word": get_display_word(game_state["word"], game_state["guessed_letters"]),
+            "guessed_letters": game_state["guessed_letters"],
+            "attempts_left": game_state["attempts_left"],
+            "status": game_state["status"],
+            "players": game_state["players"],
+            "current_player": game_state["players"][game_state["current_player_index"]],
+            "max_players": game_state["max_players"]
+        }
+        
+        # If game is over, reveal the word
+        if game_state["status"] != "in_progress":
+            display_data["word"] = game_state["word"]
+        
+        return display_data
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get game: {str(e)}"
+        )
+
+@app.post("/games/{game_id}/join")
+async def join_game(game_id: str, join_request: JoinGameRequest, user = Depends(get_current_user)):
+    """Join an existing game."""
+    try:
+        # Get the current game state
+        response = supabase.table("games").select("*").eq("id", game_id).execute()
+        
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Game not found"
+            )
+        
+        game_state = response.data[0]
+        
+        # Check if game is full
+        if len(game_state["players"]) >= game_state["max_players"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Game is full"
+            )
+        
+        # Check if player is already in the game
+        if join_request.player_id in game_state["players"]:
+            return {"message": "Already in the game"}
+        
+        # Add player to the game
+        game_state["players"].append(join_request.player_id)
+        
+        # Update the game in Supabase
+        supabase.table("games").update({"players": game_state["players"]}).eq("id", game_id).execute()
+        
+        return {"message": "Successfully joined the game"}
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to join game: {str(e)}"
+        )
+
+@app.post("/games/{game_id}/guess")
+async def make_guess(game_id: str, guess_request: GuessRequest, user = Depends(get_current_user)):
+    """Make a guess in the game."""
+    try:
+        # Get the current game state
+        response = supabase.table("games").select("*").eq("id", game_id).execute()
+        
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Game not found"
+            )
+        
+        game_state_dict = response.data[0]
+        
+        # Convert to GameState model
+        game_state = GameState(**game_state_dict)
+        
+        # Update game state with the guess
+        updated_game_state = update_game_state(game_state, guess_request.letter, guess_request.player_id)
+        
+        # Update the game in Supabase
+        supabase.table("games").update({
+            "guessed_letters": updated_game_state.guessed_letters,
+            "attempts_left": updated_game_state.attempts_left,
+            "status": updated_game_state.status,
+            "current_player_index": updated_game_state.current_player_index
+        }).eq("id", game_id).execute()
+        
+        # Prepare response data
+        display_data = {
+            "display_word": get_display_word(updated_game_state.word, updated_game_state.guessed_letters),
+            "guessed_letters": updated_game_state.guessed_letters,
+            "attempts_left": updated_game_state.attempts_left,
+            "status": updated_game_state.status,
+            "current_player": updated_game_state.players[updated_game_state.current_player_index]
+        }
+        
+        # If game is over, reveal the word
+        if updated_game_state.status != "in_progress":
+            display_data["word"] = updated_game_state.word
+        
+        return display_data
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to process guess: {str(e)}"
+        )
+
+@app.delete("/games/{game_id}")
+async def delete_game(game_id: str, user = Depends(get_current_user)):
+    """Delete a game and optionally create a new one."""
+    try:
+        # Get the current game state to verify it exists
+        response = supabase.table("games").select("*").eq("id", game_id).execute()
+        
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Game not found"
+            )
+        
+        # Delete the game from Supabase
+        supabase.table("games").delete().eq("id", game_id).execute()
+        
+        return {"message": "Game deleted successfully"}
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete game: {str(e)}"
+        )
+
+@app.post("/games/{game_id}/restart")
+async def restart_game(game_id: str, game_data: GameCreate = None, user = Depends(get_current_user)):
+    """Delete the current game and create a new one with the same ID."""
+    try:
+        # Get the current game state to verify it exists and get players
+        response = supabase.table("games").select("*").eq("id", game_id).execute()
+        
+        if not response.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Game not found"
+            )
+        
+        old_game = response.data[0]
+        players = old_game["players"]
+        
+        # Delete the old game
+        supabase.table("games").delete().eq("id", game_id).execute()
+        
+        # Create a new game with the same ID
+        word = game_data.word.lower() if game_data and game_data.word else RandomWords().get_random_word().lower()
+        max_players = game_data.max_players if game_data else 2
+        
+        new_game_state = {
+            "id": game_id,
+            "word": word,
+            "guessed_letters": [],
+            "attempts_left": 6,
+            "status": "in_progress",
+            "players": players,
+            "current_player_index": 0,
+            "max_players": max_players
+        }
+        
+        # Store new game in Supabase
+        supabase.table("games").insert(new_game_state).execute()
+        
+        return {"message": "Game restarted successfully", "game_id": game_id}
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to restart game: {str(e)}"
+        )
 
 @app.get("/games/public")
-async def get_public_games():
-    """Return a list of public games."""
-    public_games = []
-
-    for game_id, game_state in manager.game_states.items():
-        if game_state.status == "in_progress" and len(game_state.players) < game_state.max_players:
-            public_games.append({
-                "game_id": game_id,
-                "players": game_state.players,
-                "max_players": game_state.max_players,
-                "status": game_state.status
-            })
-
-    return public_games 
-
-
-
-# Game Restart WebSocket route
-@app.websocket("/ws/restart/{game_id}")
-async def restart_game_endpoint(websocket: WebSocket, game_id: str):
-    # Get query parameters
-    query_params = dict(websocket.query_params)
-    custom_word = query_params.get("word", None)
-    player_id = query_params.get("player_id", None)
-    token = query_params.get("token", None)
-    
-    # Validate token before allowing connection
-    if not token or token == "undefined" or not is_valid_token(token):
-        await websocket.close(code=403, reason="Missing or invalid token")
-        return
-    
-    # If no player_id provided, generate a random one
-    if not player_id:
-        player_id = str(random.randint(1000, 9999))
-    
-    await websocket.accept()
-    
+async def get_public_games(user = Depends(get_current_user)):
+    """Return a list of public games that are in progress and not full."""
     try:
-        # Check if game exists
-        if game_id not in manager.game_states:
-            await websocket.send_json({
-                "type": "error",
-                "data": "Game not found"
-            })
-            await websocket.close()
-            return
-            
-        # Check if player is part of the game
-        game_state = manager.get_game_state(game_id)
-        if player_id not in game_state.players:
-            await websocket.send_json({
-                "type": "error",
-                "data": "You are not part of this game"
-            })
-            await websocket.close()
-            return
-            
-        # Restart the game
-        game_state = manager.restart_game(game_id, custom_word)
+        response = supabase.table("games").select("*").eq("status", "in_progress").execute()
         
-        # Broadcast game restart message
-        await manager.broadcast({
-            "type": "info",
-            "data": "Game has been restarted"
-        }, game_id)
+        public_games = []
+        for game in response.data:
+            if len(game["players"]) < game["max_players"]:
+                public_games.append({
+                    "game_id": game["id"],
+                    "players": game["players"],
+                    "max_players": game["max_players"],
+                    "status": game["status"]
+                })
         
-        # Send new game state
-        await manager.broadcast({
-            "type": "game_state",
-            "data": {
-                "word": "*" * len(game_state.word),  # Hide the actual word
-                "display_word": get_display_word(game_state.word, game_state.guessed_letters),
-                "guessed_letters": game_state.guessed_letters,
-                "attempts_left": game_state.attempts_left,
-                "status": game_state.status,
-                "players": game_state.players,
-                "current_player": game_state.players[game_state.current_player_index]
-            }
-        }, game_id)
-        
-        # Keep the connection open for further restart requests
-        while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
-            
-            if message["type"] == "restart":
-                # Get custom word if provided
-                custom_word = message.get("word", None)
-                
-                # Restart the game
-                game_state = manager.restart_game(game_id, custom_word)
-                
-                # Broadcast game restart message
-                await manager.broadcast({
-                    "type": "info",
-                    "data": "Game has been restarted"
-                }, game_id)
-                
-                # Send new game state
-                await manager.broadcast({
-                    "type": "game_state",
-                    "data": {
-                        "word": "*" * len(game_state.word),  # Hide the actual word
-                        "display_word": get_display_word(game_state.word, game_state.guessed_letters),
-                        "guessed_letters": game_state.guessed_letters,
-                        "attempts_left": game_state.attempts_left,
-                        "status": game_state.status,
-                        "players": game_state.players,
-                        "current_player": game_state.players[game_state.current_player_index]
-                    }
-                }, game_id)
-    except WebSocketDisconnect:
-        # Just close the restart connection, don't affect the game
-        pass
+        return public_games
     except Exception as e:
-        print(f"Error in restart endpoint: {str(e)}")
-        await websocket.close()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get public games: {str(e)}"
+        )
 
-# Helper function to get display word with guessed letters revealed
-def get_display_word(word: str, guessed_letters: List[str]) -> str:
-    return "".join([letter if letter in guessed_letters else "_" for letter in word])
+# Database operations
+def execute_query(query, params=None):
+    """Execute a database query and return results"""
+    with get_db_cursor() as cursor:
+        cursor.execute(query, params or ())
+        try:
+            results = cursor.fetchall()
+            # Get column names
+            column_names = [desc[0] for desc in cursor.description]
+            # Convert to list of dictionaries
+            return [dict(zip(column_names, row)) for row in results]
+        except:
+            # For queries that don't return results (INSERT, UPDATE, DELETE)
+            return None
+
+# Event handlers for application startup and shutdown
+@app.on_event("startup")
+async def startup_db_client():
+    """Initialize database connection on startup"""
+    global db_connection
+    db_connection = connect_to_db()
+    if db_connection is None:
+        print("Warning: Failed to establish initial database connection")
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    """Close database connection on shutdown"""
+    global db_connection
+    if db_connection is not None and not db_connection.closed:
+        db_connection.close()
+        print("Database connection closed")
 
 # Run the application
 if __name__ == "__main__":
