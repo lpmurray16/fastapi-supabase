@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from uuid import uuid4
+from datetime import datetime
 
 # Import database connection function
 from db_connect import connect_to_db
@@ -53,48 +54,26 @@ class UserLogin(BaseModel):
 class GameState(BaseModel):
     id: str
     word: str
-    guessed_letters: List[str] = []  # Stored as text[] in DB
+    guessed_letters: List[str] = []
     attempts_left: int
     status: str
-    wrong_guesses: List[str] = []  # Stored as text[] in DB
-    correct_guesses: List[str] = []  # Stored as text[] in DB
+    wrong_guesses: List[str] = []
+    correct_guesses: List[str] = []
     created_by: str
     created_at: str
-
-    @property
-    def guessed_letters_list(self) -> List[str]:
-        return self.guessed_letters
-
-    @property
-    def wrong_guesses_list(self) -> List[str]:
-        return self.wrong_guesses
-
-    @property
-    def correct_guesses_list(self) -> List[str]:
-        return self.correct_guesses
+    hints: List[str] = []
 
 class PublicGameState(BaseModel):
     id: str
     masked_word: str
-    guessed_letters: List[str] = []  # Stored as text[] in DB
+    guessed_letters: List[str] = []
     attempts_left: int
     status: str
-    wrong_guesses: List[str] = []  # Stored as text[] in DB
-    correct_guesses: List[str] = []  # Stored as text[] in DB
+    wrong_guesses: List[str] = []
+    correct_guesses: List[str] = []
     created_by: str
     created_at: str
-
-    @property
-    def guessed_letters_list(self) -> List[str]:
-        return self.guessed_letters
-
-    @property
-    def wrong_guesses_list(self) -> List[str]:
-        return self.wrong_guesses
-
-    @property
-    def correct_guesses_list(self) -> List[str]:
-        return self.correct_guesses
+    hints: List[str] = []
 
 class PublicGameResponse(BaseModel):
     game_id: str
@@ -108,17 +87,19 @@ class LetterGuess(BaseModel):
 class CreateGame(BaseModel):
     word: str
 
+class HintRequest(BaseModel):
+    hint: str
+
 # ======================================
 # 🔧 UTILITY FUNCTIONS
 # ======================================
-def mask_word(word: str, guessed_letters: str) -> str:
+def mask_word(word: str, guessed_letters: List[str]) -> str:
     """Mask the word, replacing unguessed letters with asterisks (*) but keeping spaces visible."""
-    letters_list = list(guessed_letters) if isinstance(guessed_letters, str) else guessed_letters
-    return "".join([char if char.lower() in letters_list or char == " " else "*" for char in word])
+    return "".join([char if char.lower() in guessed_letters or char == " " else "*" for char in word])
 
-def generate_random_number_between_1000_9999() -> int:
-    """Generate a random number between 1000 and 9999."""
-    return random.randint(1000, 9999)
+def generate_random_number_between_1000_9999() -> str:
+    """Generate a random number between 1000 and 9999 and return as string."""
+    return str(random.randint(1000, 9999))
 
 # ======================================
 # 🔒 AUTHENTICATION HELPERS
@@ -127,15 +108,17 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     token = credentials.credentials
     try:
         response = supabase.auth.get_user(token)
-        # Extract user data from the response and create a custom user object with id
-        user_data = response.user
-        # Create a simple object with id attribute
-        class UserResponse:
-            def __init__(self, id):
-                self.id = id
+        if not hasattr(response, "user") or not response.user:
+            raise Exception("Invalid user data from Supabase")
         
-        return UserResponse(user_data.id)
-    except Exception as e:
+        class UserResponse:
+            def __init__(self, id, email):
+                self.id = id
+                self.email = email
+        
+        # Pass both id and email to UserResponse
+        return UserResponse(response.user.id, response.user.email)
+    except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication credentials")
 
 # ======================================
@@ -156,7 +139,7 @@ def get_db_cursor():
     try:
         yield cursor
         db_connection.commit()
-    except Exception as e:
+    except Exception:
         db_connection.rollback()
         raise e
     finally:
@@ -205,6 +188,31 @@ async def logout(user=Depends(get_current_user)):
 # ======================================
 # 🎮 GAME ROUTES
 # ======================================
+@app.post("/games", response_model=GameState)
+async def create_game(game: CreateGame, user=Depends(get_current_user)):
+    """Create a new game with the provided word."""
+    try:
+        game_id = generate_random_number_between_1000_9999()
+        created_at = datetime.now().isoformat()  # Convert datetime to ISO format string
+
+        query = """
+        INSERT INTO games (id, word, guessed_letters, attempts_left, status, wrong_guesses, correct_guesses, created_by, created_at, hints)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING *
+        """
+        params = (game_id, game.word, [], 6, "in_progress", [], [], user.email, created_at, [])
+
+        result = execute_query(query, params)
+        if not result:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create game")
+        
+        # Ensure created_at is a string
+        result[0]['created_at'] = str(result[0]['created_at'])
+
+        return GameState(**result[0])
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
 @app.get("/games/public", response_model=List[PublicGameResponse])
 async def get_public_games(user=Depends(get_current_user)):
     """Return a list of public games that are in progress."""
@@ -217,7 +225,8 @@ async def get_public_games(user=Depends(get_current_user)):
             {
                 "game_id": game["id"],
                 "status": game["status"],
-                "created_by": game["created_by"]
+                "created_by": game["created_by"],
+                "created_at": str(game["created_at"])  # Convert datetime to string
             }
             for game in results
         ]
@@ -233,94 +242,149 @@ async def get_game_by_id(game_id: str, user=Depends(get_current_user)):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Game {game_id} not found")
 
         game = results[0]
+        # Ensure hints is a list, default to empty list if None
+        hints = game["hints"] if game["hints"] is not None else []
+        
         return PublicGameState(
             id=game["id"],
             masked_word=mask_word(game["word"], game["guessed_letters"]),
             guessed_letters=game["guessed_letters"],
             attempts_left=game["attempts_left"],
             status=game["status"],
-
             wrong_guesses=game["wrong_guesses"],
             correct_guesses=game["correct_guesses"],
             created_by=game["created_by"],
-            created_at=game["created_at"]
+            created_at=str(game["created_at"]),  # Convert datetime to string
+            hints=hints
         )
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-@app.post("/games", response_model=GameState)
-async def create_game(game: CreateGame, user=Depends(get_current_user)):
-    """Create a new game with the provided word."""
+@app.post("/games/{game_id}/guess", response_model=PublicGameState)
+async def submit_guess(game_id: str, guess: LetterGuess, user=Depends(get_current_user)):
+    """Submit a letter guess for an ongoing game."""
     try:
-        game_id = generate_random_number_between_1000_9999()
-        current_time = execute_query("SELECT NOW()")[0]["now"]
-        
-        # Create new game with default values
+        # Fetch the game from the database
+        results = execute_query("SELECT * FROM games WHERE id = %s", (game_id,))
+        if not results:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Game {game_id} not found")
+
+        game = results[0]
+
+        # If the game is already won or lost, prevent further guesses
+        if game["status"] in ["won", "lost"]:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Game is already completed")
+
+        letter = guess.letter.lower()
+
+        # Update guessed_letters
+        guessed_letters = set(game["guessed_letters"]) | {letter}
+
+        # Check if the letter is in the word
+        if letter in game["word"].lower():
+            correct_guesses = set(game["correct_guesses"]) | {letter}
+            wrong_guesses = set(game["wrong_guesses"])
+        else:
+            correct_guesses = set(game["correct_guesses"])
+            wrong_guesses = set(game["wrong_guesses"]) | {letter}
+
+        # Decrease attempts left if incorrect guess
+        attempts_left = game["attempts_left"] - (1 if letter not in game["word"].lower() else 0)
+
+        # Determine game status
+        if set([c.lower() for c in game["word"] if c.isalpha()]).issubset(correct_guesses):
+            status = "won"
+        elif attempts_left <= 0:
+            status = "lost"
+        else:
+            status = "in_progress"
+
+        # Update the game state in the database
         query = """
-        INSERT INTO games (id, word, guessed_letters, attempts_left, status, wrong_guesses, correct_guesses, created_by, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        UPDATE games
+        SET guessed_letters = %s, correct_guesses = %s, wrong_guesses = %s, attempts_left = %s, status = %s
+        WHERE id = %s
         RETURNING *
         """
+        params = (list(guessed_letters), list(correct_guesses), list(wrong_guesses), attempts_left, status, game_id)
+        updated_game = execute_query(query, params)
+
+        if not updated_game:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to update game state")
+
+        updated_game = updated_game[0]
+
+        # Return the updated game state as PublicGameState
+        # Ensure hints is a list, default to empty list if None
+        hints = updated_game["hints"] if updated_game["hints"] is not None else []
         
-        # Set default values
-        params = (
-            game_id,
-            game.word,
-            [],  # guessed_letters
-            6,   # attempts_left
-            "in_progress",  # status
-            [],  # wrong_guesses
-            [],  # correct_guesses
-            str(user.id),  # created_by
-            current_time
+        return PublicGameState(
+            id=updated_game["id"],
+            masked_word=mask_word(updated_game["word"], updated_game["guessed_letters"]),
+            guessed_letters=updated_game["guessed_letters"],
+            attempts_left=updated_game["attempts_left"],
+            status=updated_game["status"],
+            wrong_guesses=updated_game["wrong_guesses"],
+            correct_guesses=updated_game["correct_guesses"],
+            created_by=updated_game["created_by"],
+            created_at=str(updated_game["created_at"]),  # Convert datetime to string
+            hints=hints
         )
-        
-        result = execute_query(query, params)
-        if not result:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create game")
-            
-        return GameState(**result[0])
+
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-# ======================================
-# 🔄 GAME LOGIC
-# ======================================
-def update_game_state(game_state: GameState, letter: str, player_id: str) -> GameState:
-    # Check if the player making the guess is not the game creator
-    if player_id == game_state.created_by:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Game creator cannot make guesses"
+@app.post("/games/{game_id}/addhint", response_model=PublicGameState)
+async def add_hint(game_id: str, hint: HintRequest, user=Depends(get_current_user)):
+    """Add a hint to the ongoing game."""
+    try:
+        # Fetch the game from the database
+        results = execute_query("SELECT * FROM games WHERE id = %s", (game_id,))
+        if not results:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Game {game_id} not found")
+
+        game = results[0]
+
+        # If the game is already won or lost, prevent adding hints
+        if game["status"] in ["won", "lost"]:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Game is already completed")
+
+        # Update hints
+        hints = game["hints"] if game["hints"] is not None else []
+        hints.append(hint.hint)
+
+        # Update the game state in the database
+        query = """
+        UPDATE games
+        SET hints = %s
+        WHERE id = %s
+        RETURNING *
+        """
+        params = (hints, game_id)
+        updated_game = execute_query(query, params)
+
+        if not updated_game:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to update game hints")
+
+        updated_game = updated_game[0]
+
+        # Return the updated game state as PublicGameState
+        return PublicGameState(
+            id=updated_game["id"],
+            masked_word=mask_word(updated_game["word"], updated_game["guessed_letters"]),
+            guessed_letters=updated_game["guessed_letters"],
+            attempts_left=updated_game["attempts_left"],
+            status=updated_game["status"],
+            wrong_guesses=updated_game["wrong_guesses"],
+            correct_guesses=updated_game["correct_guesses"],
+            created_by=updated_game["created_by"],
+            created_at=str(updated_game["created_at"]),  # Convert datetime to string
+            hints=updated_game["hints"]
         )
 
-    letter = letter.lower()
-    
-    # Update guessed_letters
-    if letter not in game_state.guessed_letters:
-        game_state.guessed_letters += letter
-    
-    if letter in game_state.word.lower():
-        # Update correct_guesses
-        if letter not in game_state.correct_guesses:
-            game_state.correct_guesses += letter
-    else:
-        # Update wrong_guesses
-        if letter not in game_state.wrong_guesses:
-            game_state.wrong_guesses += letter
-            game_state.attempts_left -= 1
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    # Check if all letters in the word have been guessed
-    all_word_letters = set([c.lower() for c in game_state.word if c.isalpha()])
-    guessed_correct_letters = set(game_state.correct_guesses)
-    
-    if all_word_letters.issubset(guessed_correct_letters):
-        game_state.status = "won"
-
-    if game_state.attempts_left <= 0:
-        game_state.status = "lost"
-
-    return game_state
 
 # ======================================
 # ⚙️ SERVER STARTUP & SHUTDOWN
