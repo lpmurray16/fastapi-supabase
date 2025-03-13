@@ -112,12 +112,16 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             raise Exception("Invalid user data from Supabase")
         
         class UserResponse:
-            def __init__(self, id, email):
+            def __init__(self, id, email, username):
                 self.id = id
                 self.email = email
+                self.username = username
         
-        # Pass both id and email to UserResponse
-        return UserResponse(response.user.id, response.user.email)
+        # Extract username from user metadata or profile
+        username = response.user.user_metadata.get("username", "Unknown")  # Adjust the key as needed
+        
+        # Pass id, email, and username to UserResponse
+        return UserResponse(response.user.id, response.user.email, username)
     except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication credentials")
 
@@ -200,7 +204,7 @@ async def create_game(game: CreateGame, user=Depends(get_current_user)):
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING *
         """
-        params = (game_id, game.word, [], 6, "in_progress", [], [], user.email, created_at, [])
+        params = (game_id, game.word, [], 6, "in_progress", [], [], user.username, created_at, [])
 
         result = execute_query(query, params)
         if not result:
@@ -387,7 +391,6 @@ async def add_hint(game_id: str, hint: HintRequest, user=Depends(get_current_use
 
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-
 
 # ======================================
 # ⚙️ SERVER STARTUP & SHUTDOWN
