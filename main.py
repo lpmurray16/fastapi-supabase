@@ -314,13 +314,16 @@ async def submit_guess(game_id: str, guess: LetterGuess, user=Depends(get_curren
 
         updated_game = updated_game[0]
 
+        # Determine masked word or full word based on game status
+        masked_word = updated_game["word"] if status == "lost" else mask_word(updated_game["word"], updated_game["guessed_letters"])
+
         # Return the updated game state as PublicGameState
         # Ensure hints is a list, default to empty list if None
         hints = updated_game["hints"] if updated_game["hints"] is not None else []
         
         return PublicGameState(
             id=updated_game["id"],
-            masked_word=mask_word(updated_game["word"], updated_game["guessed_letters"]),
+            masked_word=masked_word,
             guessed_letters=updated_game["guessed_letters"],
             attempts_left=updated_game["attempts_left"],
             status=updated_game["status"],
