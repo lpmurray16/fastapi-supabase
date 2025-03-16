@@ -80,6 +80,7 @@ class PublicGameResponse(BaseModel):
     status: str
     created_by: str
     created_at: str
+    attempts_left: int
 
 class LetterGuess(BaseModel):
     letter: str
@@ -230,7 +231,8 @@ async def get_public_games(user=Depends(get_current_user)):
                 "game_id": game["id"],
                 "status": game["status"],
                 "created_by": game["created_by"],
-                "created_at": str(game["created_at"])  # Convert datetime to string
+                "created_at": str(game["created_at"]),  # Convert datetime to string
+                "attempts_left": game["attempts_left"]
             }
             for game in results
         ]
