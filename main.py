@@ -91,6 +91,15 @@ class CreateGame(BaseModel):
 class HintRequest(BaseModel):
     hint: str
 
+class RefreshToken(BaseModel):
+    refresh_token: str
+
+class RefreshResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    expires_at: int
+    user: dict
+
 # ======================================
 # 🔧 UTILITY FUNCTIONS
 # ======================================
@@ -189,6 +198,30 @@ async def logout(user=Depends(get_current_user)):
         return {"message": "Successfully logged out"}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+@app.post("/auth/refresh", response_model=RefreshResponse)
+async def refresh_token(refresh_request: RefreshToken):
+    """Refresh the access token using a valid refresh token."""
+    try:
+        # Validate the refresh token and get new tokens
+        response = supabase.auth.refresh_session(refresh_request.refresh_token)
+        
+        # Extract user data
+        user_data = {
+            "id": response.user.id,
+            "email": response.user.email,
+            "username": response.user.user_metadata.get("username", "Unknown")
+        }
+        
+        # Return the new tokens and user data
+        return {
+            "access_token": response.session.access_token,
+            "refresh_token": response.session.refresh_token,
+            "expires_at": int(response.session.expires_at),
+            "user": user_data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Failed to refresh token: {str(e)}")
 
 # ======================================
 # 🎮 GAME ROUTES
