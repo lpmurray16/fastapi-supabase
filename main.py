@@ -428,6 +428,14 @@ async def add_hint(game_id: str, hint: HintRequest, user=Depends(get_current_use
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 # ======================================
+# 🔍 HEALTH CHECK ROUTES
+# ======================================
+@app.get("/ping")
+async def ping():
+    """Health check endpoint that returns a success status."""
+    return {"status": "success", "message": "API is running"}
+
+# ======================================
 # ⚙️ SERVER STARTUP & SHUTDOWN
 # ======================================
 @app.on_event("startup")
