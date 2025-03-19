@@ -153,7 +153,7 @@ def get_db_cursor():
     try:
         yield cursor
         db_connection.commit()
-    except Exception:
+    except Exception as e:
         db_connection.rollback()
         raise e
     finally:
